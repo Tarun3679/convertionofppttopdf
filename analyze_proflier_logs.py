@@ -272,12 +272,16 @@ class MemoryLeakAnalyzer:
         Detect jobs that started but never finished - PRIMARY OOM suspects
 
         This is the most reliable indicator of which job caused a container crash.
+        Works regardless of log order (forward or reverse chronological).
         """
+        # Sort entries by timestamp to handle both forward and reverse chronological logs
+        sorted_entries = sorted(self.entries, key=lambda e: e.timestamp)
+
         # Track START entries by job name and timestamp
         started_jobs: Dict[Tuple[str, datetime], LogEntry] = {}
         completed_job_keys: set = set()
 
-        for entry in self.entries:
+        for entry in sorted_entries:
             if entry.log_type == 'START':
                 key = (entry.job_name, entry.timestamp)
                 started_jobs[key] = entry
