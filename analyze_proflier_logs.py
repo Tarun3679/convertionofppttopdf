@@ -53,10 +53,22 @@ class LogEntry:
 
 
 @dataclass
+class OrphanedJob:
+    """Job that started but never completed - primary OOM suspect"""
+    job_name: str
+    start_time: datetime
+    rss_at_start: float
+    vms_at_start: float
+    memory_percent_at_start: float
+    system_available_at_start: float
+
+
+@dataclass
 class JobStats:
     """Aggregated statistics for a job across multiple runs"""
     job_name: str
     run_count: int = 0
+    orphaned_count: int = 0  # Number of times job started but didn't finish
 
     # RSS tracking
     rss_deltas: List[float] = field(default_factory=list)
@@ -81,6 +93,10 @@ class JobStats:
     baseline_shift_mb: float = 0.0  # First run vs last run
     cumulative_impact: float = 0.0  # frequency × avg_delta
 
+    # Container-aware metrics
+    time_to_oom_hours: Optional[float] = None  # Predicted hours until OOM
+    headroom_consumed_percent: float = 0.0  # % of available headroom consumed
+
     # Statistical metrics
     stddev_rss_delta: float = 0.0
     is_statistical_outlier: bool = False
@@ -99,8 +115,17 @@ class MemoryAnalysisReport:
     overall_rss_growth: float  # Total RSS change from start to end
     overall_growth_rate_mb_per_hour: float
 
+    # CRITICAL: Orphaned jobs (started but never finished)
+    orphaned_jobs: List[OrphanedJob]
+
     job_stats: Dict[str, JobStats]
     top_culprits: List[Tuple[str, JobStats]]  # Sorted by leak_score
+
+    # Container context
+    container_limit_mb: Optional[float] = None
+    current_rss_mb: Optional[float] = None
+    available_headroom_mb: Optional[float] = None
+    headroom_percent: Optional[float] = None
 
     # Global statistics
     global_avg_delta: float = 0.0
@@ -198,15 +223,18 @@ class MemoryLeakAnalyzer:
     """
     Analyzes memory logs using industrial-standard leak detection metrics
 
-    Implements:
-    1. Linear regression for RSS growth rate (industry standard)
-    2. Per-job average delta (Stripe approach)
-    3. Baseline shift detection (long-running patterns)
-    4. Statistical outlier detection
-    5. Cumulative impact scoring (frequency × delta)
+    Implements (in priority order):
+    1. Orphaned job detection (START without END) - PRIMARY OOM indicator
+    2. Container-aware analysis (time-to-OOM, headroom)
+    3. Linear regression for RSS growth rate (industry standard)
+    4. Per-job average delta (Stripe approach)
+    5. Baseline shift detection (long-running patterns)
+    6. Statistical outlier detection
+    7. Cumulative impact scoring (frequency × delta)
     """
 
     def __init__(self,
+                 container_limit_mb: Optional[float] = None,
                  growth_rate_threshold_mb_per_hour: float = 1.0,
                  baseline_shift_threshold_mb: float = 10.0,
                  avg_delta_threshold_mb: float = 0.5):
@@ -214,16 +242,19 @@ class MemoryLeakAnalyzer:
         Initialize analyzer with configurable thresholds
 
         Args:
+            container_limit_mb: Container memory limit in MB (e.g., 2048 for 2GiB)
             growth_rate_threshold_mb_per_hour: Alert if RSS grows faster than this (default: 1.0 MB/hr)
             baseline_shift_threshold_mb: Alert if baseline shifts by this much (default: 10 MB)
             avg_delta_threshold_mb: Alert if average delta exceeds this (default: 0.5 MB)
         """
+        self.container_limit_mb = container_limit_mb
         self.growth_rate_threshold = growth_rate_threshold_mb_per_hour
         self.baseline_shift_threshold = baseline_shift_threshold_mb
         self.avg_delta_threshold = avg_delta_threshold_mb
 
         self.entries: List[LogEntry] = []
         self.job_stats: Dict[str, JobStats] = defaultdict(lambda: JobStats(job_name=""))
+        self.orphaned_jobs: List[OrphanedJob] = []
 
     def parse_logs(self, log_lines: List[str]) -> int:
         """Parse log lines and extract entries"""
@@ -236,8 +267,57 @@ class MemoryLeakAnalyzer:
 
         return len(self.entries)
 
+    def detect_orphaned_jobs(self):
+        """
+        Detect jobs that started but never finished - PRIMARY OOM suspects
+
+        This is the most reliable indicator of which job caused a container crash.
+        """
+        # Track START entries by job name and timestamp
+        started_jobs: Dict[Tuple[str, datetime], LogEntry] = {}
+        completed_job_keys: set = set()
+
+        for entry in self.entries:
+            if entry.log_type == 'START':
+                key = (entry.job_name, entry.timestamp)
+                started_jobs[key] = entry
+            elif entry.log_type == 'END':
+                # Find matching START entry (closest timestamp before END)
+                matching_start = None
+                min_time_diff = None
+
+                for (job_name, start_time) in started_jobs.keys():
+                    if job_name == entry.job_name and start_time <= entry.timestamp:
+                        time_diff = (entry.timestamp - start_time).total_seconds()
+                        if min_time_diff is None or time_diff < min_time_diff:
+                            min_time_diff = time_diff
+                            matching_start = (job_name, start_time)
+
+                if matching_start:
+                    completed_job_keys.add(matching_start)
+
+        # Jobs with START but no matching END
+        orphaned_keys = set(started_jobs.keys()) - completed_job_keys
+
+        for key in orphaned_keys:
+            entry = started_jobs[key]
+            orphaned = OrphanedJob(
+                job_name=entry.job_name,
+                start_time=entry.timestamp,
+                rss_at_start=entry.rss_mb or 0.0,
+                vms_at_start=entry.vms_mb or 0.0,
+                memory_percent_at_start=entry.memory_percent or 0.0,
+                system_available_at_start=entry.system_available_mb or 0.0
+            )
+            self.orphaned_jobs.append(orphaned)
+
+            # Track orphaned count in job stats
+            stats = self.job_stats[entry.job_name]
+            stats.job_name = entry.job_name
+            stats.orphaned_count += 1
+
     def aggregate_job_stats(self):
-        """Aggregate statistics per job"""
+        """Aggregate statistics per job (for completed jobs)"""
         for entry in self.entries:
             if entry.log_type == 'END':
                 stats = self.job_stats[entry.job_name]
@@ -292,6 +372,15 @@ class MemoryLeakAnalyzer:
             # Industry Metric 3: Cumulative Impact (Stripe approach)
             stats.cumulative_impact = stats.run_count * stats.avg_rss_delta
 
+            # Container-aware metrics
+            if self.container_limit_mb and stats.avg_peak_rss > 0:
+                available_headroom = self.container_limit_mb - stats.avg_peak_rss
+                stats.headroom_consumed_percent = (stats.avg_peak_rss / self.container_limit_mb) * 100
+
+                # Time to OOM prediction
+                if stats.rss_growth_rate_mb_per_hour > 0 and available_headroom > 0:
+                    stats.time_to_oom_hours = available_headroom / stats.rss_growth_rate_mb_per_hour
+
         # Global statistics for outlier detection
         if all_deltas:
             global_avg = statistics.mean(all_deltas)
@@ -337,7 +426,8 @@ class MemoryLeakAnalyzer:
         Calculate leak score for each job using multi-metric approach
 
         Score components (industry best practices):
-        - RSS growth rate × 40 (primary indicator)
+        - Orphaned jobs × 10000 (CRITICAL - job caused crash)
+        - RSS growth rate × 40 (primary leak indicator)
         - Average RSS delta × 20 (per-execution leak)
         - Baseline shift × 15 (long-term drift)
         - VMS delta × 10 (virtual memory issues)
@@ -347,7 +437,11 @@ class MemoryLeakAnalyzer:
         for stats in self.job_stats.values():
             score = 0.0
 
-            # Weight 40: Growth rate (most important)
+            # Weight 10000: Orphaned jobs (MOST CRITICAL - job likely caused OOM)
+            if stats.orphaned_count > 0:
+                score += stats.orphaned_count * 10000
+
+            # Weight 40: Growth rate (most important for completed jobs)
             if stats.rss_growth_rate_mb_per_hour > self.growth_rate_threshold:
                 score += stats.rss_growth_rate_mb_per_hour * 40
 
@@ -376,6 +470,9 @@ class MemoryLeakAnalyzer:
         if not self.entries:
             raise ValueError("No log entries to analyze")
 
+        # Step 0: CRITICAL - Detect orphaned jobs (START without END)
+        self.detect_orphaned_jobs()
+
         # Step 1: Aggregate per-job statistics
         self.aggregate_job_stats()
 
@@ -385,7 +482,7 @@ class MemoryLeakAnalyzer:
         # Step 3: Calculate leak scores
         self.calculate_leak_scores()
 
-        # Step 4: Sort jobs by leak score
+        # Step 4: Sort jobs by leak score (orphaned jobs will be at top)
         sorted_jobs = sorted(
             self.job_stats.items(),
             key=lambda x: x[1].leak_score,
@@ -413,14 +510,30 @@ class MemoryLeakAnalyzer:
         global_avg = statistics.mean(all_deltas) if all_deltas else 0.0
         global_stddev = statistics.stdev(all_deltas) if len(all_deltas) > 1 else 0.0
 
+        # Container context
+        current_rss = None
+        if end_entries:
+            current_rss = end_entries[-1].rss_after
+
+        available_headroom = None
+        headroom_percent = None
+        if self.container_limit_mb and current_rss:
+            available_headroom = self.container_limit_mb - current_rss
+            headroom_percent = (available_headroom / self.container_limit_mb) * 100
+
         return MemoryAnalysisReport(
             total_entries=len(self.entries),
             total_jobs_tracked=len(self.job_stats),
             time_range=time_range,
             overall_rss_growth=overall_growth,
             overall_growth_rate_mb_per_hour=overall_growth_rate,
+            orphaned_jobs=self.orphaned_jobs,
             job_stats=dict(self.job_stats),
             top_culprits=sorted_jobs[:10],  # Top 10 culprits
+            container_limit_mb=self.container_limit_mb,
+            current_rss_mb=current_rss,
+            available_headroom_mb=available_headroom,
+            headroom_percent=headroom_percent,
             global_avg_delta=global_avg,
             global_stddev_delta=global_stddev
         )
@@ -445,12 +558,68 @@ class ReportGenerator:
             "",
             f"  Overall RSS growth: {report.overall_rss_growth:+.2f} MB",
             f"  Overall growth rate: {report.overall_growth_rate_mb_per_hour:+.2f} MB/hour",
+            ""
+        ]
+
+        # Container context
+        if report.container_limit_mb:
+            lines.extend([
+                "CONTAINER CONTEXT:",
+                f"  Container memory limit: {report.container_limit_mb:.2f} MB ({report.container_limit_mb / 1024:.2f} GiB)",
+                f"  Current RSS usage: {report.current_rss_mb:.2f} MB ({(report.current_rss_mb / report.container_limit_mb * 100):.1f}% of limit)" if report.current_rss_mb else "  Current RSS usage: N/A",
+                f"  Available headroom: {report.available_headroom_mb:.2f} MB ({report.headroom_percent:.1f}%)" if report.available_headroom_mb else "  Available headroom: N/A",
+                ""
+            ])
+
+        # CRITICAL SECTION: Orphaned jobs
+        if report.orphaned_jobs:
+            lines.extend([
+                "=" * 100,
+                "!!! CRITICAL: JOBS THAT STARTED BUT NEVER COMPLETED !!!",
+                "=" * 100,
+                "",
+                "These jobs are PRIMARY OOM SUSPECTS - they started but have no completion log.",
+                "This typically indicates the container was killed (OOM) during job execution.",
+                ""
+            ])
+
+            for idx, orphaned in enumerate(report.orphaned_jobs, 1):
+                lines.extend([
+                    f"{idx}. {orphaned.job_name}",
+                    f"   {'─' * 95}",
+                    f"   [STATUS]: JOB STARTED BUT NEVER FINISHED - LIKELY CAUSED CONTAINER CRASH",
+                    f"   Start Time: {orphaned.start_time}",
+                    f"   RSS at Start: {orphaned.rss_at_start:.2f} MB",
+                    f"   VMS at Start: {orphaned.vms_at_start:.2f} MB",
+                    f"   Memory % at Start: {orphaned.memory_percent_at_start:.2f}%",
+                    f"   System Available at Start: {orphaned.system_available_at_start:.2f} MB",
+                    ""
+                ])
+
+            lines.extend([
+                "RECOMMENDATION: Investigate the jobs listed above. They are the most likely",
+                "                culprits for OOM issues. Check what these jobs do and why",
+                "                they might consume excessive memory.",
+                ""
+            ])
+        else:
+            lines.extend([
+                "=" * 100,
+                "ORPHANED JOBS CHECK: PASSED",
+                "=" * 100,
+                "",
+                "All jobs that started also completed successfully.",
+                "No evidence of container crash during job execution in this log sample.",
+                ""
+            ])
+
+        lines.extend([
             "",
             "=" * 100,
             "TOP MEMORY LEAK CULPRITS (ranked by leak score)",
             "=" * 100,
             ""
-        ]
+        ])
 
         if not report.top_culprits:
             lines.append("  No culprits identified.")
@@ -460,6 +629,8 @@ class ReportGenerator:
                     continue
 
                 leak_indicators = []
+                if stats.orphaned_count > 0:
+                    leak_indicators.append("ORPHANED_JOB")
                 if stats.rss_growth_rate_mb_per_hour > 1.0:
                     leak_indicators.append("GROWTH_RATE")
                 if stats.avg_rss_delta > 0.5:
@@ -467,14 +638,27 @@ class ReportGenerator:
                 if stats.baseline_shift_mb > 10:
                     leak_indicators.append("BASELINE_SHIFT")
 
-                priority = "HIGH PRIORITY" if stats.leak_score > 50 else ""
+                # Determine severity
+                if stats.orphaned_count > 0:
+                    severity = "CRITICAL - CAUSED CRASH"
+                elif stats.leak_score > 50:
+                    severity = "HIGH PRIORITY"
+                else:
+                    severity = ""
+
                 indicators = f"[{', '.join(leak_indicators)}]" if leak_indicators else ""
 
                 lines.extend([
                     f"{rank}. {job_name}",
                     f"   {'─' * 95}",
-                    f"   Leak Score: {stats.leak_score:.2f} {priority} {indicators}",
-                    f"   Run Count: {stats.run_count}",
+                    f"   Leak Score: {stats.leak_score:.2f} {severity} {indicators}",
+                    f"   Completed Runs: {stats.run_count}",
+                ])
+
+                if stats.orphaned_count > 0:
+                    lines.append(f"   Orphaned Runs: {stats.orphaned_count} [CRITICAL - Job did not complete]")
+
+                lines.extend([
                     "",
                     f"   RSS Metrics:",
                     f"     • Growth Rate: {stats.rss_growth_rate_mb_per_hour:+.2f} MB/hour {'[LEAK]' if stats.rss_growth_rate_mb_per_hour > 1.0 else '[OK]'}",
@@ -486,6 +670,22 @@ class ReportGenerator:
                     f"   Peak RSS:",
                     f"     • Average: {stats.avg_peak_rss:.2f} MB",
                     f"     • Maximum: {stats.max_peak_rss:.2f} MB",
+                ])
+
+                # Container-aware metrics
+                if stats.headroom_consumed_percent > 0:
+                    lines.append(f"     • Headroom Consumed: {stats.headroom_consumed_percent:.1f}% of container limit")
+
+                if stats.time_to_oom_hours is not None:
+                    if stats.time_to_oom_hours < 24:
+                        time_str = f"{stats.time_to_oom_hours:.1f} hours [CRITICAL]"
+                    elif stats.time_to_oom_hours < 168:  # 7 days
+                        time_str = f"{stats.time_to_oom_hours / 24:.1f} days [WARNING]"
+                    else:
+                        time_str = f"{stats.time_to_oom_hours / 24:.1f} days"
+                    lines.append(f"     • Predicted Time to OOM: {time_str}")
+
+                lines.extend([
                     "",
                     f"   VMS Metrics:",
                     f"     • Avg VMS Delta: {stats.avg_vms_delta:+.2f} MB",
@@ -509,12 +709,31 @@ class ReportGenerator:
             "INTERPRETATION GUIDE",
             "=" * 100,
             "",
+            "Priority Levels:",
+            "  1. CRITICAL - Orphaned Jobs: Jobs with START but no END log",
+            "     → Most reliable indicator that this job caused container crash/OOM",
+            "     → Investigate immediately",
+            "",
+            "  2. HIGH PRIORITY - Growth Rate: RSS growing > 1 MB/hour",
+            "     → Will cause future OOM if not addressed",
+            "     → Time-to-OOM prediction shows urgency",
+            "",
+            "  3. WARNING - Statistical Anomalies: Outliers, high cumulative impact",
+            "     → Monitor these jobs for trends",
+            "",
             "Leak Indicators:",
+            "  • Orphaned Job: Job started but never finished (PRIMARY OOM indicator)",
             "  • Growth Rate > 1 MB/hour: Sustained memory growth over time",
             "  • Avg Delta > 0.5 MB: Per-execution memory leak (Stripe approach)",
             "  • Baseline Shift > 10 MB: Long-running baseline drift",
             "  • High Cumulative Impact: Frequent small leaks accumulating",
             "  • Statistical Outlier: Unusual memory behavior compared to other jobs",
+            "",
+            "Container-Aware Metrics:",
+            "  • Headroom: Available memory before hitting container limit",
+            "  • Time to OOM: Predicted hours/days until container runs out of memory",
+            "  • Critical: < 24 hours to OOM",
+            "  • Warning: < 7 days to OOM",
             "",
             "Metrics Explained:",
             "  • RSS (Resident Set Size): Actual physical memory used",
@@ -538,18 +757,22 @@ class ReportGenerator:
     def generate_csv_report(report: MemoryAnalysisReport) -> str:
         """Generate CSV report for spreadsheet analysis"""
         lines = [
-            "job_name,run_count,leak_score,growth_rate_mb_per_hour,avg_rss_delta_mb,"
+            "job_name,orphaned_count,run_count,leak_score,growth_rate_mb_per_hour,avg_rss_delta_mb,"
             "total_rss_delta_mb,baseline_shift_mb,cumulative_impact_mb,avg_vms_delta_mb,"
-            "avg_peak_rss_mb,max_peak_rss_mb,is_outlier"
+            "avg_peak_rss_mb,max_peak_rss_mb,time_to_oom_hours,headroom_consumed_pct,is_outlier"
         ]
 
         for job_name, stats in report.top_culprits:
+            time_to_oom = stats.time_to_oom_hours if stats.time_to_oom_hours else ""
+            headroom_pct = f"{stats.headroom_consumed_percent:.2f}" if stats.headroom_consumed_percent > 0 else ""
+
             lines.append(
-                f'"{job_name}",{stats.run_count},{stats.leak_score:.2f},'
+                f'"{job_name}",{stats.orphaned_count},{stats.run_count},{stats.leak_score:.2f},'
                 f'{stats.rss_growth_rate_mb_per_hour:.2f},{stats.avg_rss_delta:.2f},'
                 f'{stats.total_rss_delta:.2f},{stats.baseline_shift_mb:.2f},'
                 f'{stats.cumulative_impact:.2f},{stats.avg_vms_delta:.2f},'
                 f'{stats.avg_peak_rss:.2f},{stats.max_peak_rss:.2f},'
+                f'{time_to_oom},{headroom_pct},'
                 f'{1 if stats.is_statistical_outlier else 0}'
             )
 
@@ -566,11 +789,16 @@ def main():
         epilog="""
 Examples:
   python analyze_memory_logs.py logfile.txt
+  python analyze_memory_logs.py logfile.txt --container-limit 2048
   python analyze_memory_logs.py logfile.txt --format csv
   cat logfile.txt | python analyze_memory_logs.py
   python analyze_memory_logs.py logfile.txt --growth-rate-threshold 2.0
 
+Container-aware analysis (recommended for production):
+  python analyze_memory_logs.py logfile.txt --container-limit 2048
+
 Thresholds (configurable):
+  --container-limit: Container memory limit in MB (e.g., 2048 for 2GiB)
   --growth-rate-threshold: Alert if RSS grows faster than X MB/hour (default: 1.0)
   --baseline-shift-threshold: Alert if baseline shifts by X MB (default: 10.0)
   --avg-delta-threshold: Alert if average delta exceeds X MB (default: 0.5)
@@ -587,6 +815,11 @@ Thresholds (configurable):
         choices=['text', 'csv'],
         default='text',
         help='Output format (default: text)'
+    )
+    parser.add_argument(
+        '--container-limit',
+        type=float,
+        help='Container memory limit in MB (e.g., 2048 for 2GiB container)'
     )
     parser.add_argument(
         '--growth-rate-threshold',
@@ -630,6 +863,7 @@ Thresholds (configurable):
 
     # Analyze
     analyzer = MemoryLeakAnalyzer(
+        container_limit_mb=args.container_limit,
         growth_rate_threshold_mb_per_hour=args.growth_rate_threshold,
         baseline_shift_threshold_mb=args.baseline_shift_threshold,
         avg_delta_threshold_mb=args.avg_delta_threshold
