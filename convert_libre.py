@@ -2,6 +2,7 @@
 """
 Memory-Optimized LibreOffice Document Converter
 Uses memory_profiler for accurate memory tracking and OOM prevention.
+Includes external link detection and sanitization to prevent OOM from problematic PowerPoints.
 """
 
 import os
@@ -14,14 +15,17 @@ import time
 import threading
 import gc
 import resource
+import zipfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import IntEnum
 import atexit
 import hashlib
 import psutil
 
-# Import the memory profiler from the repo
 from memory_profiler import MemoryProfiler
 
 # Configure logging
@@ -30,6 +34,36 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class RiskLevel(IntEnum):
+    """Risk levels for files with external links."""
+    SAFE = 0
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+    CRITICAL = 4
+
+
+@dataclass
+class LinkScanResult:
+    """Result of scanning a file for external links."""
+    risk_level: RiskLevel
+    external_links: List[str]
+    link_types: List[str]
+    is_sanitizable: bool
+    file_size_mb: float
+
+
+@dataclass
+class SanitizationResult:
+    """Result of sanitizing a file."""
+    success: bool
+    sanitized_path: Optional[str]
+    operations_performed: List[str]
+    size_before_mb: float
+    size_after_mb: float
+    error_message: Optional[str] = None
 
 
 class ProcessTracker:
@@ -157,6 +191,317 @@ class ProcessTracker:
                 logger.error(f"Error cleaning up process {pid}: {e}")
 
 
+class ExternalLinkDetector:
+    """
+    Detects external links in PowerPoint files by inspecting PPTX XML structure.
+    Fast and memory-efficient - no LibreOffice loading required.
+    """
+
+    def scan_pptx_file(self, file_path: str) -> LinkScanResult:
+        """Scan a PPTX file for external links and assess risk level."""
+        try:
+            file_size_mb = Path(file_path).stat().st_size / (1024 * 1024)
+
+            if not zipfile.is_zipfile(file_path):
+                return LinkScanResult(
+                    risk_level=RiskLevel.SAFE,
+                    external_links=[],
+                    link_types=[],
+                    is_sanitizable=True,
+                    file_size_mb=file_size_mb
+                )
+
+            external_links = []
+            link_types = []
+
+            with zipfile.ZipFile(file_path, 'r') as pptx_zip:
+                ole_objects = self._find_ole_objects(pptx_zip)
+                chart_links = self._find_chart_external_links(pptx_zip)
+                external_rels = self._find_external_relationships(pptx_zip)
+
+                if ole_objects:
+                    external_links.extend(ole_objects)
+                    link_types.append('ole')
+
+                if chart_links:
+                    external_links.extend(chart_links)
+                    link_types.append('chart')
+
+                if external_rels:
+                    external_links.extend(external_rels)
+                    link_types.append('external_rel')
+
+            risk_level = self._assess_risk_level(link_types, external_links)
+            is_sanitizable = risk_level != RiskLevel.CRITICAL
+
+            return LinkScanResult(
+                risk_level=risk_level,
+                external_links=external_links,
+                link_types=link_types,
+                is_sanitizable=is_sanitizable,
+                file_size_mb=file_size_mb
+            )
+
+        except Exception as e:
+            logger.warning(f"Error scanning {file_path}: {e}")
+            return LinkScanResult(
+                risk_level=RiskLevel.SAFE,
+                external_links=[],
+                link_types=[],
+                is_sanitizable=True,
+                file_size_mb=0.0
+            )
+
+    def _find_ole_objects(self, pptx_zip: zipfile.ZipFile) -> List[str]:
+        """Find OLE objects embedded in slides."""
+        ole_objects = []
+
+        for file_name in pptx_zip.namelist():
+            if file_name.startswith('ppt/slides/slide') and file_name.endswith('.xml'):
+                try:
+                    content = pptx_zip.read(file_name).decode('utf-8')
+                    if '<p:oleObj' in content or 'oleObject' in content:
+                        ole_objects.append(f"OLE in {file_name}")
+                except Exception:
+                    pass
+
+        return ole_objects
+
+    def _find_chart_external_links(self, pptx_zip: zipfile.ZipFile) -> List[str]:
+        """Find charts with external data links."""
+        chart_links = []
+
+        for file_name in pptx_zip.namelist():
+            if file_name.startswith('ppt/charts/') and file_name.endswith('.xml'):
+                try:
+                    content = pptx_zip.read(file_name).decode('utf-8')
+                    if '<c:externalData' in content:
+                        chart_links.append(f"External data in {file_name}")
+                except Exception:
+                    pass
+
+        return chart_links
+
+    def _find_external_relationships(self, pptx_zip: zipfile.ZipFile) -> List[str]:
+        """Find external relationships in .rels files."""
+        external_rels = []
+
+        for file_name in pptx_zip.namelist():
+            if file_name.endswith('.rels'):
+                try:
+                    content = pptx_zip.read(file_name).decode('utf-8')
+
+                    if 'TargetMode="External"' in content:
+                        if 'Target="http://' in content or 'Target="https://' in content:
+                            external_rels.append(f"Network link in {file_name}")
+                        elif 'Target="file://' in content:
+                            external_rels.append(f"File link in {file_name}")
+                except Exception:
+                    pass
+
+        return external_rels
+
+    def _assess_risk_level(self, link_types: List[str], external_links: List[str]) -> RiskLevel:
+        """Assess risk level based on detected link types."""
+        if not link_types:
+            return RiskLevel.SAFE
+
+        if 'ole' in link_types:
+            return RiskLevel.HIGH
+
+        if 'chart' in link_types and len(external_links) > 3:
+            return RiskLevel.HIGH
+
+        if 'chart' in link_types:
+            return RiskLevel.MEDIUM
+
+        if 'external_rel' in link_types:
+            network_links = [link for link in external_links if 'Network link' in link]
+            if network_links:
+                return RiskLevel.MEDIUM
+
+        return RiskLevel.LOW
+
+
+class LinkSanitizer:
+    """
+    Sanitizes PowerPoint files by removing or disabling external links.
+    Works by modifying PPTX XML structure directly.
+    """
+
+    def sanitize_pptx(self, input_path: str, output_path: str) -> SanitizationResult:
+        """Create a sanitized copy of the PPTX file."""
+        size_before_mb = Path(input_path).stat().st_size / (1024 * 1024)
+        operations_performed = []
+
+        try:
+            with zipfile.ZipFile(input_path, 'r') as input_zip:
+                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as output_zip:
+                    for item in input_zip.namelist():
+                        content = input_zip.read(item)
+
+                        if item.endswith('.xml'):
+                            modified_content = self._sanitize_xml_content(item, content, operations_performed)
+                            output_zip.writestr(item, modified_content)
+                        else:
+                            output_zip.writestr(item, content)
+
+            size_after_mb = Path(output_path).stat().st_size / (1024 * 1024)
+
+            return SanitizationResult(
+                success=True,
+                sanitized_path=output_path,
+                operations_performed=operations_performed,
+                size_before_mb=size_before_mb,
+                size_after_mb=size_after_mb
+            )
+
+        except Exception as e:
+            logger.error(f"Sanitization failed: {e}")
+            return SanitizationResult(
+                success=False,
+                sanitized_path=None,
+                operations_performed=operations_performed,
+                size_before_mb=size_before_mb,
+                size_after_mb=0.0,
+                error_message=str(e)
+            )
+
+    def _sanitize_xml_content(self, file_name: str, content: bytes, operations: List[str]) -> bytes:
+        """Sanitize XML content by removing problematic elements."""
+        try:
+            content_str = content.decode('utf-8')
+
+            if file_name.startswith('ppt/slides/') and '<p:oleObj' in content_str:
+                content_str = self._remove_ole_objects(content_str)
+                operations.append(f"Removed OLE from {file_name}")
+
+            if file_name.startswith('ppt/charts/') and '<c:externalData' in content_str:
+                content_str = self._break_chart_links(content_str)
+                operations.append(f"Broke chart links in {file_name}")
+
+            if file_name.endswith('.rels') and 'TargetMode="External"' in content_str:
+                content_str = self._remove_external_relationships(content_str)
+                operations.append(f"Removed external rels in {file_name}")
+
+            return content_str.encode('utf-8')
+
+        except Exception as e:
+            logger.debug(f"Could not sanitize {file_name}: {e}")
+            return content
+
+    def _remove_ole_objects(self, xml_content: str) -> str:
+        """Remove OLE object elements from XML."""
+        try:
+            root = ET.fromstring(xml_content)
+            namespaces = {'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'}
+
+            for ole_obj in root.findall('.//p:oleObj', namespaces):
+                parent = root.find('.//*[p:oleObj]', namespaces)
+                if parent is not None:
+                    parent.remove(ole_obj)
+
+            return ET.tostring(root, encoding='unicode')
+        except Exception:
+            pattern_start = '<p:oleObj'
+            pattern_end = '</p:oleObj>'
+
+            while pattern_start in xml_content:
+                start_idx = xml_content.find(pattern_start)
+                end_idx = xml_content.find(pattern_end, start_idx)
+
+                if end_idx == -1:
+                    break
+
+                xml_content = xml_content[:start_idx] + xml_content[end_idx + len(pattern_end):]
+
+            return xml_content
+
+    def _break_chart_links(self, xml_content: str) -> str:
+        """Remove external data references from charts."""
+        patterns_to_remove = [
+            ('<c:externalData', '</c:externalData>'),
+            ('<c:autoUpdate', '/>'),
+        ]
+
+        for start_pattern, end_pattern in patterns_to_remove:
+            while start_pattern in xml_content:
+                start_idx = xml_content.find(start_pattern)
+                end_idx = xml_content.find(end_pattern, start_idx)
+
+                if end_idx == -1:
+                    break
+
+                xml_content = xml_content[:start_idx] + xml_content[end_idx + len(end_pattern):]
+
+        return xml_content
+
+    def _remove_external_relationships(self, xml_content: str) -> str:
+        """Remove external relationships from .rels files."""
+        try:
+            root = ET.fromstring(xml_content)
+
+            for relationship in root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                target_mode = relationship.get('TargetMode')
+                if target_mode == 'External':
+                    root.remove(relationship)
+
+            return ET.tostring(root, encoding='unicode')
+        except Exception:
+            return xml_content
+
+
+def _find_libreoffice_path() -> str:
+    """
+    Find LibreOffice installation path based on operating system.
+
+    Returns:
+        Path to LibreOffice executable, or 'soffice' as fallback
+    """
+    import platform
+
+    system = platform.system()
+
+    if system == "Windows":
+        possible_paths = [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            r"C:\Program Files\LibreOffice 7\program\soffice.exe",
+            r"C:\Program Files\LibreOffice 6\program\soffice.exe",
+        ]
+
+        for path in possible_paths:
+            if os.path.exists(path):
+                logger.info(f"Found LibreOffice at: {path}")
+                return path
+
+    elif system == "Linux":
+        possible_paths = [
+            "/usr/bin/soffice",
+            "/usr/bin/libreoffice",
+            "/usr/local/bin/soffice",
+            "/opt/libreoffice/program/soffice",
+        ]
+
+        for path in possible_paths:
+            if os.path.exists(path):
+                logger.info(f"Found LibreOffice at: {path}")
+                return path
+
+    elif system == "Darwin":
+        possible_paths = [
+            "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        ]
+
+        for path in possible_paths:
+            if os.path.exists(path):
+                logger.info(f"Found LibreOffice at: {path}")
+                return path
+
+    logger.warning("LibreOffice path not found, using fallback 'soffice'")
+    return "soffice"
+
+
 class LibreOfficeConverter:
     """
     Memory-optimized converter with memory_profiler integration.
@@ -170,7 +515,9 @@ class LibreOfficeConverter:
         cleanup_interval: int = 300,
         max_memory_mb: int = 2048,
         memory_check_interval: float = 1.0,
-        enable_continuous_monitoring: bool = True
+        enable_continuous_monitoring: bool = True,
+        enable_link_detection: bool = True,
+        enable_auto_sanitization: bool = True
     ):
         """
         Initialize converter.
@@ -183,6 +530,8 @@ class LibreOfficeConverter:
             max_memory_mb: Maximum memory allowed per conversion process
             memory_check_interval: How often to check memory usage
             enable_continuous_monitoring: Enable continuous memory monitoring
+            enable_link_detection: Enable external link detection
+            enable_auto_sanitization: Enable automatic sanitization of risky files
         """
         self.soffice_path = soffice_path
         self.timeout = timeout
@@ -190,14 +539,20 @@ class LibreOfficeConverter:
         self.cleanup_interval = cleanup_interval
         self.max_memory_mb = max_memory_mb
         self.memory_check_interval = memory_check_interval
+        self.enable_link_detection = enable_link_detection
+        self.enable_auto_sanitization = enable_auto_sanitization
         self.process_tracker = ProcessTracker()
 
         # Initialize memory profiler with continuous monitoring
         self.memory_profiler = MemoryProfiler(
             enable_continuous_monitoring=enable_continuous_monitoring,
             monitoring_interval=memory_check_interval,
-            log_interval=30.0  # Log every 30 seconds
+            log_interval=30.0
         )
+
+        # Initialize link detector and sanitizer
+        self.link_detector = ExternalLinkDetector()
+        self.link_sanitizer = LinkSanitizer()
 
         # Verify LibreOffice
         self._verify_libreoffice()
@@ -517,6 +872,60 @@ class LibreOfficeConverter:
                 "conversion may take longer and use more memory"
             )
 
+        # Scan for external links (PowerPoint files only)
+        sanitized_file_path = None
+        file_to_convert = str(input_path)
+
+        if self.enable_link_detection and input_path.suffix.lower() in ['.pptx', '.ppt']:
+            scan_result = self.link_detector.scan_pptx_file(str(input_path))
+
+            logger.info(
+                f"[LINK_SCAN] file='{input_path.name}' risk={scan_result.risk_level.name} "
+                f"links_found={len(scan_result.external_links)} types={scan_result.link_types}"
+            )
+
+            if scan_result.risk_level >= RiskLevel.MEDIUM:
+                if self.enable_auto_sanitization and scan_result.is_sanitizable:
+                    logger.info(f"[SANITIZE] Attempting to sanitize '{input_path.name}'")
+
+                    sanitized_fd, sanitized_file_path = tempfile.mkstemp(
+                        prefix="sanitized_",
+                        suffix=".pptx"
+                    )
+                    os.close(sanitized_fd)
+
+                    sanitization_result = self.link_sanitizer.sanitize_pptx(
+                        str(input_path),
+                        sanitized_file_path
+                    )
+
+                    if sanitization_result.success:
+                        logger.info(
+                            f"[SANITIZE] Success - operations: {sanitization_result.operations_performed}, "
+                            f"size: {sanitization_result.size_before_mb:.1f}MB -> "
+                            f"{sanitization_result.size_after_mb:.1f}MB"
+                        )
+                        file_to_convert = sanitized_file_path
+                    else:
+                        logger.warning(
+                            f"[SANITIZE] Failed: {sanitization_result.error_message}"
+                        )
+
+                        if scan_result.risk_level == RiskLevel.CRITICAL:
+                            if sanitized_file_path:
+                                try:
+                                    os.unlink(sanitized_file_path)
+                                except:
+                                    pass
+                            return False, f"Critical risk file - sanitization failed: {sanitization_result.error_message}", None
+                else:
+                    if scan_result.risk_level == RiskLevel.CRITICAL:
+                        return False, f"Critical risk file with external links - skipping to prevent OOM", None
+
+                    logger.warning(
+                        f"[RISK] File has {scan_result.risk_level.name} risk but proceeding without sanitization"
+                    )
+
         # Check system memory before starting using psutil
         system_mem = psutil.virtual_memory()
         available_mb = system_mem.available / (1024 * 1024)
@@ -555,9 +964,9 @@ class LibreOfficeConverter:
                     process = None
 
                     try:
-                        # Build command
+                        # Build command using the sanitized file if available
                         command = self._build_conversion_command(
-                            str(input_path),
+                            file_to_convert,
                             output_dir,
                             profile_dir
                         )
@@ -673,6 +1082,14 @@ class LibreOfficeConverter:
                 func=do_conversion
             )
 
+            # Cleanup sanitized file if it was created
+            if sanitized_file_path:
+                try:
+                    os.unlink(sanitized_file_path)
+                    logger.debug(f"Cleaned up sanitized file: {sanitized_file_path}")
+                except Exception as e:
+                    logger.debug(f"Could not cleanup sanitized file: {e}")
+
             # If successful, return the result
             if result and result[0]:
                 return result
@@ -687,6 +1104,13 @@ class LibreOfficeConverter:
             return result if result else (False, "Unknown error", None)
 
         except Exception as e:
+            # Cleanup sanitized file if it was created
+            if sanitized_file_path:
+                try:
+                    os.unlink(sanitized_file_path)
+                except:
+                    pass
+
             # Exception during conversion
             if attempt < self.max_retries:
                 logger.info(f"Retrying after error (attempt {attempt + 1})...")
@@ -712,153 +1136,209 @@ class LibreOfficeConverter:
         """Convert Excel file to PDF."""
         return self.convert_to_pdf(xlsx_file, output_dir)
 
-    def batch_convert(
+    def _convert_powerpoint_to_pdf_bytes(
         self,
-        input_files: List[str],
-        output_dir: Optional[str] = None
-    ) -> dict:
+        document_bytes: bytes,
+        temp_input_path: str,
+        temp_output_dir: str
+    ) -> bytes:
         """
-        Convert multiple files sequentially with memory profiling.
+        Convert PowerPoint bytes to PDF bytes.
 
         Args:
-            input_files: List of file paths
-            output_dir: Output directory
+            document_bytes: PowerPoint file content as bytes
+            temp_input_path: Temporary path for input file
+            temp_output_dir: Temporary directory for output
 
         Returns:
-            Dictionary with results for each file
+            PDF content as bytes
+
+        Raises:
+            Exception: If conversion fails
         """
-        results = {}
-
-        logger.info(f"Starting batch conversion of {len(input_files)} files")
-
-        for idx, input_file in enumerate(input_files, 1):
-            logger.info(f"Processing file {idx}/{len(input_files)}: {Path(input_file).name}")
-
-            # Check system memory before each conversion
-            system_mem = psutil.virtual_memory()
-            available_mb = system_mem.available / (1024 * 1024)
-            logger.debug(f"Available memory: {available_mb:.1f}MB")
-
-            if available_mb < 500:
-                logger.error("Insufficient memory for conversion, stopping batch")
-                results[input_file] = {
-                    'success': False,
-                    'message': 'Insufficient system memory',
-                    'output_path': None
-                }
-                break
+        try:
+            with open(temp_input_path, 'wb') as f:
+                f.write(document_bytes)
 
             success, message, output_path = self.convert_to_pdf(
-                input_file,
-                output_dir
+                temp_input_path,
+                temp_output_dir
             )
 
-            results[input_file] = {
-                'success': success,
-                'message': message,
-                'output_path': output_path
-            }
+            if not success or not output_path:
+                raise RuntimeError(f"PowerPoint conversion failed: {message}")
 
-            # Aggressive cleanup between conversions
+            with open(output_path, 'rb') as f:
+                pdf_bytes = f.read()
+
+            return pdf_bytes
+
+        finally:
+            if os.path.exists(temp_input_path):
+                try:
+                    os.unlink(temp_input_path)
+                except:
+                    pass
+
+    def _convert_excel_to_pdf_bytes(
+        self,
+        document_bytes: bytes,
+        temp_input_path: str,
+        temp_output_dir: str
+    ) -> bytes:
+        """
+        Convert Excel bytes to PDF bytes.
+
+        Args:
+            document_bytes: Excel file content as bytes
+            temp_input_path: Temporary path for input file
+            temp_output_dir: Temporary directory for output
+
+        Returns:
+            PDF content as bytes
+
+        Raises:
+            Exception: If conversion fails
+        """
+        try:
+            with open(temp_input_path, 'wb') as f:
+                f.write(document_bytes)
+
+            success, message, output_path = self.convert_to_pdf(
+                temp_input_path,
+                temp_output_dir
+            )
+
+            if not success or not output_path:
+                raise RuntimeError(f"Excel conversion failed: {message}")
+
+            with open(output_path, 'rb') as f:
+                pdf_bytes = f.read()
+
+            return pdf_bytes
+
+        finally:
+            if os.path.exists(temp_input_path):
+                try:
+                    os.unlink(temp_input_path)
+                except:
+                    pass
+
+    def convert_office_to_pdf_bytes(
+        self,
+        document_bytes: bytes,
+        office_type: str
+    ) -> bytes:
+        """
+        Convert Office document bytes to PDF bytes.
+
+        Args:
+            document_bytes: Office document content as bytes
+            office_type: Type of office document ('powerpoint', 'excel', 'word')
+
+        Returns:
+            PDF content as bytes
+
+        Raises:
+            ValueError: If office_type is not supported
+            RuntimeError: If conversion fails
+        """
+        office_type_lower = office_type.lower()
+
+        extension_map = {
+            'powerpoint': '.pptx',
+            'ppt': '.pptx',
+            'pptx': '.pptx',
+            'excel': '.xlsx',
+            'xls': '.xlsx',
+            'xlsx': '.xlsx',
+            'word': '.docx',
+            'doc': '.docx',
+            'docx': '.docx',
+        }
+
+        if office_type_lower not in extension_map:
+            raise ValueError(
+                f"Unsupported office type: {office_type}. "
+                f"Supported types: {list(extension_map.keys())}"
+            )
+
+        extension = extension_map[office_type_lower]
+        temp_input_fd, temp_input_path = tempfile.mkstemp(suffix=extension)
+        os.close(temp_input_fd)
+
+        temp_output_dir = tempfile.mkdtemp(prefix="pdf_output_")
+
+        try:
+            if office_type_lower in ['powerpoint', 'ppt', 'pptx']:
+                pdf_bytes = self._convert_powerpoint_to_pdf_bytes(
+                    document_bytes,
+                    temp_input_path,
+                    temp_output_dir
+                )
+
+            elif office_type_lower in ['excel', 'xls', 'xlsx']:
+                pdf_bytes = self._convert_excel_to_pdf_bytes(
+                    document_bytes,
+                    temp_input_path,
+                    temp_output_dir
+                )
+
+            elif office_type_lower in ['word', 'doc', 'docx']:
+                with open(temp_input_path, 'wb') as f:
+                    f.write(document_bytes)
+
+                success, message, output_path = self.convert_to_pdf(
+                    temp_input_path,
+                    temp_output_dir
+                )
+
+                if not success or not output_path:
+                    raise RuntimeError(f"Word conversion failed: {message}")
+
+                with open(output_path, 'rb') as f:
+                    pdf_bytes = f.read()
+            else:
+                raise ValueError(f"Unsupported office type: {office_type}")
+
+            logger.info(f"Successfully converted {office_type} bytes to PDF ({len(pdf_bytes)} bytes)")
+            return pdf_bytes
+
+        finally:
+            if os.path.exists(temp_input_path):
+                try:
+                    os.unlink(temp_input_path)
+                except:
+                    pass
+
+            if os.path.exists(temp_output_dir):
+                try:
+                    shutil.rmtree(temp_output_dir)
+                except:
+                    pass
+
             gc.collect()
 
-            # Longer delay between conversions to let system recover
-            if idx < len(input_files):
-                time.sleep(2)
 
-        # Summary
-        successful = sum(1 for r in results.values() if r['success'])
-        logger.info(
-            f"Batch conversion complete: {successful}/{len(input_files)} successful"
-        )
-
-        return results
-
-
-# Configuration
+# Example usage
 if __name__ == "__main__":
-    # ============================================================================
-    # CONFIGURATION - Modify these values as needed
-    # ============================================================================
-
-    # Memory limit: 1000MB (1GB)
-    MAX_MEMORY_MB = 1000
-
-    # Timeout per conversion: 120 seconds (2 minutes)
-    TIMEOUT_SECONDS = 120
-
-    # Max retries per file: 2
-    MAX_RETRIES = 2
-
-    # Input files to convert (add your files here)
-    INPUT_FILES = [
-        "sample.pptx",
-        "document.docx",
-        "spreadsheet.xlsx"
-    ]
-
-    # Output directory (None = same as input file location)
-    OUTPUT_DIR = None  # or set to "output/" for a specific directory
-
-    # ============================================================================
-    # END CONFIGURATION
-    # ============================================================================
-
-    # Check psutil availability
-    try:
-        import psutil
-    except ImportError:
-        logger.error("psutil module required. Install with: pip install psutil")
-        exit(1)
-
-    # Initialize converter with fixed configuration
+    # Example: Convert a file
     converter = LibreOfficeConverter(
-        timeout=TIMEOUT_SECONDS,
-        max_retries=MAX_RETRIES,
-        max_memory_mb=MAX_MEMORY_MB,
-        enable_continuous_monitoring=True
+        soffice_path=_find_libreoffice_path(),
+        timeout=120,
+        max_retries=2,
+        max_memory_mb=1000,
+        enable_link_detection=True,
+        enable_auto_sanitization=True
     )
 
-    logger.info(f"Configuration: Memory Limit={MAX_MEMORY_MB}MB, Timeout={TIMEOUT_SECONDS}s, Retries={MAX_RETRIES}")
+    # Example 1: Convert file to PDF
+    success, message, output_path = converter.convert_to_pdf("sample.pptx")
+    print(f"Conversion: {message}")
 
-    # Convert files
-    if len(INPUT_FILES) == 1:
-        # Single file
-        success, message, output_path = converter.convert_to_pdf(
-            INPUT_FILES[0],
-            OUTPUT_DIR
-        )
+    # Example 2: Convert bytes to PDF
+    with open("sample.pptx", "rb") as f:
+        pptx_bytes = f.read()
 
-        print(f"\n{'='*60}")
-        print(f"Status: {'SUCCESS' if success else 'FAILED'}")
-        print(f"Message: {message}")
-        if output_path:
-            print(f"Output: {output_path}")
-        print('='*60)
-
-        exit(0 if success else 1)
-    else:
-        # Batch conversion
-        results = converter.batch_convert(
-            INPUT_FILES,
-            OUTPUT_DIR
-        )
-
-        # Print results
-        print(f"\n{'='*60}")
-        print("BATCH CONVERSION RESULTS")
-        print('='*60)
-
-        for file_path, result in results.items():
-            status = "✓" if result['success'] else "✗"
-            print(f"\n{status} {Path(file_path).name}")
-            print(f"  {result['message']}")
-            if result['output_path']:
-                print(f"  → {result['output_path']}")
-
-        successful = sum(1 for r in results.values() if r['success'])
-        print(f"\n{'='*60}")
-        print(f"Total: {len(results)} | Success: {successful} | Failed: {len(results) - successful}")
-        print('='*60)
-
-        exit(0 if successful == len(results) else 1)
+    pdf_bytes = converter.convert_office_to_pdf_bytes(pptx_bytes, "powerpoint")
+    print(f"Converted to PDF: {len(pdf_bytes)} bytes")
