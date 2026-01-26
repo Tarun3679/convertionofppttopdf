@@ -101,7 +101,8 @@ def create_document_converter(
     enable_page_images: bool = True,
     ocr_languages: List[str] = None,
     fast_mode: bool = False,
-    image_scale: float = DEFAULT_IMAGE_SCALE
+    image_scale: float = DEFAULT_IMAGE_SCALE,
+    artifacts_path: Optional[str] = None
 ) -> DocumentConverter:
     """
     Create and configure a DocumentConverter with all pipeline options.
@@ -112,6 +113,7 @@ def create_document_converter(
         enable_images: Enable image extraction
         enable_page_images: Enable page image generation
         ocr_languages: List of language codes for OCR (e.g., ["en", "es"])
+        artifacts_path: Optional path to store downloaded models (for offline use)
         fast_mode: Use fast mode (TableFormerMode.FAST) instead of accurate mode
         image_scale: Resolution scale for images (default: 2.0)
 
@@ -127,6 +129,10 @@ def create_document_converter(
     pdf_pipeline_options.do_table_structure = enable_tables
     pdf_pipeline_options.generate_page_images = enable_page_images
     pdf_pipeline_options.images_scale = image_scale
+
+    # Set artifacts path if provided
+    if artifacts_path:
+        pdf_pipeline_options.artifacts_path = artifacts_path
 
     if enable_ocr:
         pdf_pipeline_options.ocr_options = EasyOcrOptions(
@@ -149,9 +155,8 @@ def create_document_converter(
     # Note: Other formats (DOCX, PPTX, XLSX, HTML, Image) use default pipelines
     # as they don't have the same extensive configuration options as PDF
 
-    converter = DocumentConverter(
-        format_options=format_options
-    )
+    # Create converter (artifacts_path is set in pipeline options above)
+    converter = DocumentConverter(format_options=format_options)
 
     return converter
 
@@ -750,6 +755,13 @@ Examples:
         help='Use fast mode (TableFormerMode.FAST) instead of accurate mode'
     )
 
+    parser.add_argument(
+        '--artifacts-path',
+        type=str,
+        default=None,
+        help='Path to store/load model artifacts (helps with offline use and network issues)'
+    )
+
     args = parser.parse_args()
 
     # Validate input path
@@ -780,6 +792,8 @@ Examples:
     print(f"  Table Mode: {'Fast' if args.fast_mode else 'Accurate'}")
     print(f"  Image Extraction: {'Disabled' if args.no_images else 'Enabled'}")
     print(f"  Page Images: {'Disabled' if args.no_page_images else 'Enabled'}")
+    if args.artifacts_path:
+        print(f"  Artifacts Path: {args.artifacts_path}")
 
     converter = create_document_converter(
         enable_ocr=not args.no_ocr,
@@ -787,7 +801,8 @@ Examples:
         enable_images=not args.no_images,
         enable_page_images=not args.no_page_images,
         ocr_languages=ocr_languages,
-        fast_mode=args.fast_mode
+        fast_mode=args.fast_mode,
+        artifacts_path=args.artifacts_path
     )
 
     # Process files
