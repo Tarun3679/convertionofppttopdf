@@ -1,5 +1,6 @@
 ### Docling Serve API - REST Client for VS Code
 ### Install "REST Client" extension by Huachao Mao to use this file
+### Documentation: https://github.com/docling-project/docling-serve
 
 @baseUrl = http://localhost:5001
 
@@ -10,162 +11,142 @@
 ### Check if server is running
 GET {{baseUrl}}/health
 
-###############################################################################
-# Convert to Markdown
-###############################################################################
-
-### Convert PDF to Markdown (no OCR)
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="document.pdf"
-Content-Type: application/pdf
-
-< ./samples/sample.pdf
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-md
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-false
---boundary--
-
-### Convert PPTX to Markdown (no OCR)
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="presentation.pptx"
-Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
-
-< ./samples/sample.pptx
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-md
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-false
---boundary--
-
-###############################################################################
-# Convert to JSON
-###############################################################################
-
-### Convert PDF to JSON (no OCR)
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="document.pdf"
-Content-Type: application/pdf
-
-< ./samples/sample.pdf
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-json
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-false
---boundary--
-
-### Convert PPTX to JSON (no OCR)
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="presentation.pptx"
-Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
-
-< ./samples/sample.pptx
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-json
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-false
---boundary--
-
-###############################################################################
-# Convert with OCR enabled
-###############################################################################
-
-### Convert PDF to Markdown with OCR
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="scanned.pdf"
-Content-Type: application/pdf
-
-< ./samples/scanned.pdf
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-md
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-true
---boundary
-Content-Disposition: form-data; name="ocr_lang"
-
-en
---boundary--
-
-###############################################################################
-# Other output formats
-###############################################################################
-
-### Convert to HTML
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="document.pdf"
-Content-Type: application/pdf
-
-< ./samples/sample.pdf
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-html
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-false
---boundary--
-
-### Convert to plain text
-POST {{baseUrl}}/v1/convert/file
-Content-Type: multipart/form-data; boundary=boundary
-
---boundary
-Content-Disposition: form-data; name="files"; filename="document.pdf"
-Content-Type: application/pdf
-
-< ./samples/sample.pdf
---boundary
-Content-Disposition: form-data; name="to_formats"
-
-text
---boundary
-Content-Disposition: form-data; name="do_ocr"
-
-false
---boundary--
-
-###############################################################################
-# API Documentation
-###############################################################################
-
-### Get OpenAPI docs (Swagger UI available at /docs in browser)
+### Get OpenAPI documentation
 GET {{baseUrl}}/openapi.json
+
+###############################################################################
+# Convert via URL (Recommended - simpler than file upload)
+###############################################################################
+
+### Convert PDF from URL to Markdown
+POST {{baseUrl}}/v1/convert/source
+Content-Type: application/json
+
+{
+  "sources": [
+    {
+      "kind": "http",
+      "url": "https://arxiv.org/pdf/2501.17887"
+    }
+  ],
+  "options": {
+    "to_formats": ["md"],
+    "do_ocr": false
+  }
+}
+
+### Convert PDF from URL to JSON
+POST {{baseUrl}}/v1/convert/source
+Content-Type: application/json
+
+{
+  "sources": [
+    {
+      "kind": "http",
+      "url": "https://arxiv.org/pdf/2501.17887"
+    }
+  ],
+  "options": {
+    "to_formats": ["json"],
+    "do_ocr": false
+  }
+}
+
+### Convert with OCR enabled
+POST {{baseUrl}}/v1/convert/source
+Content-Type: application/json
+
+{
+  "sources": [
+    {
+      "kind": "http",
+      "url": "https://arxiv.org/pdf/2501.17887"
+    }
+  ],
+  "options": {
+    "to_formats": ["md"],
+    "do_ocr": true,
+    "ocr_lang": ["en"]
+  }
+}
+
+###############################################################################
+# Convert Local File (multipart/form-data)
+# Note: Update the file path after < to your actual file
+###############################################################################
+
+### Convert local PDF to Markdown
+# @name convertPdfToMd
+POST {{baseUrl}}/v1/convert/file?to_formats=md&do_ocr=false
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./samples/sample.pdf
+------WebKitFormBoundary--
+
+### Convert local PPTX to Markdown
+# @name convertPptxToMd
+POST {{baseUrl}}/v1/convert/file?to_formats=md&do_ocr=false
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="presentation.pptx"
+Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
+
+< ./samples/sample.pptx
+------WebKitFormBoundary--
+
+### Convert local PDF to JSON
+# @name convertPdfToJson
+POST {{baseUrl}}/v1/convert/file?to_formats=json&do_ocr=false
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./samples/sample.pdf
+------WebKitFormBoundary--
+
+### Convert local PPTX to JSON
+# @name convertPptxToJson
+POST {{baseUrl}}/v1/convert/file?to_formats=json&do_ocr=false
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
+
+------WebKitFormBoundary
+Content-Disposition: form-data; name="files"; filename="presentation.pptx"
+Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
+
+< ./samples/sample.pptx
+------WebKitFormBoundary--
+
+###############################################################################
+# Async Conversion (for large files)
+###############################################################################
+
+### Submit async conversion job
+# @name asyncConvert
+POST {{baseUrl}}/v1/convert/source/async
+Content-Type: application/json
+
+{
+  "sources": [
+    {
+      "kind": "http",
+      "url": "https://arxiv.org/pdf/2501.17887"
+    }
+  ],
+  "options": {
+    "to_formats": ["md"],
+    "do_ocr": false
+  }
+}
+
+### Poll task status (replace TASK_ID with actual ID from async response)
+GET {{baseUrl}}/v1/status/poll/TASK_ID
+
+### Get task result (replace TASK_ID with actual ID)
+GET {{baseUrl}}/v1/result/TASK_ID
