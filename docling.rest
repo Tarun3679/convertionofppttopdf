@@ -1,0 +1,171 @@
+### Docling Serve API - REST Client for VS Code
+### Install "REST Client" extension by Huachao Mao to use this file
+
+@baseUrl = http://localhost:5001
+
+###############################################################################
+# Health Check
+###############################################################################
+
+### Check if server is running
+GET {{baseUrl}}/health
+
+###############################################################################
+# Convert to Markdown
+###############################################################################
+
+### Convert PDF to Markdown (no OCR)
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./samples/sample.pdf
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+md
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+false
+--boundary--
+
+### Convert PPTX to Markdown (no OCR)
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="presentation.pptx"
+Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
+
+< ./samples/sample.pptx
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+md
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+false
+--boundary--
+
+###############################################################################
+# Convert to JSON
+###############################################################################
+
+### Convert PDF to JSON (no OCR)
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./samples/sample.pdf
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+json
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+false
+--boundary--
+
+### Convert PPTX to JSON (no OCR)
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="presentation.pptx"
+Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
+
+< ./samples/sample.pptx
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+json
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+false
+--boundary--
+
+###############################################################################
+# Convert with OCR enabled
+###############################################################################
+
+### Convert PDF to Markdown with OCR
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="scanned.pdf"
+Content-Type: application/pdf
+
+< ./samples/scanned.pdf
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+md
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+true
+--boundary
+Content-Disposition: form-data; name="ocr_lang"
+
+en
+--boundary--
+
+###############################################################################
+# Other output formats
+###############################################################################
+
+### Convert to HTML
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./samples/sample.pdf
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+html
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+false
+--boundary--
+
+### Convert to plain text
+POST {{baseUrl}}/v1/convert/file
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="files"; filename="document.pdf"
+Content-Type: application/pdf
+
+< ./samples/sample.pdf
+--boundary
+Content-Disposition: form-data; name="to_formats"
+
+text
+--boundary
+Content-Disposition: form-data; name="do_ocr"
+
+false
+--boundary--
+
+###############################################################################
+# API Documentation
+###############################################################################
+
+### Get OpenAPI docs (Swagger UI available at /docs in browser)
+GET {{baseUrl}}/openapi.json
