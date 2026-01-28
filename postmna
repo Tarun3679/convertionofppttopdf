@@ -1,0 +1,64 @@
+# =============================================================================
+# HEALTH CHECK & DOCS
+# =============================================================================
+
+# Health check
+curl.exe -X GET "http://aidev-d230458-002.dc.gs.com:5001/health"
+
+# OpenAPI schema
+curl.exe -X GET "http://aidev-d230458-002.dc.gs.com:5001/openapi.json"
+
+# =============================================================================
+# CONVERT VIA URL (no local file needed)
+# =============================================================================
+
+# Convert PDF from URL to Markdown (default settings)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/source" -H "Content-Type: application/json" -d "{\"http_sources\": [{\"url\": \"https://arxiv.org/pdf/2501.17887\"}]}"
+
+# Convert PDF from URL to Markdown (no OCR)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/source" -H "Content-Type: application/json" -d "{\"http_sources\": [{\"url\": \"https://arxiv.org/pdf/2501.17887\"}], \"options\": {\"to_formats\": [\"md\"], \"do_ocr\": false}}"
+
+# Convert PDF from URL to JSON (no OCR)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/source" -H "Content-Type: application/json" -d "{\"http_sources\": [{\"url\": \"https://arxiv.org/pdf/2501.17887\"}], \"options\": {\"to_formats\": [\"json\"], \"do_ocr\": false}}"
+
+# Convert with OCR enabled
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/source" -H "Content-Type: application/json" -d "{\"http_sources\": [{\"url\": \"https://arxiv.org/pdf/2501.17887\"}], \"options\": {\"to_formats\": [\"md\"], \"do_ocr\": true, \"ocr_engine\": \"easyocr\", \"ocr_lang\": [\"en\"]}}"
+
+# =============================================================================
+# CONVERT LOCAL FILE
+# =============================================================================
+
+# Convert local PDF to Markdown (no OCR)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/file" -F "files=@C:\path\to\document.pdf" -F "to_formats=md" -F "do_ocr=false"
+
+# Convert local PPTX to Markdown (no OCR)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/file" -F "files=@C:\path\to\presentation.pptx" -F "to_formats=md" -F "do_ocr=false"
+
+# Convert local PDF to JSON (no OCR)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/file" -F "files=@C:\path\to\document.pdf" -F "to_formats=json" -F "do_ocr=false"
+
+# Convert local PPTX to JSON (no OCR)
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/file" -F "files=@C:\path\to\presentation.pptx" -F "to_formats=json" -F "do_ocr=false"
+
+# Convert local file with OCR enabled
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/file" -F "files=@C:\path\to\scanned.pdf" -F "to_formats=md" -F "do_ocr=true" -F "ocr_lang=en"
+
+# =============================================================================
+# SAVE OUTPUT TO FILE
+# =============================================================================
+
+# Convert and save output to file
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/file" -F "files=@C:\path\to\document.pdf" -F "to_formats=md" -F "do_ocr=false" -o output.json
+
+# =============================================================================
+# ASYNC CONVERSION (for large files)
+# =============================================================================
+
+# Submit async job
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/source/async" -H "Content-Type: application/json" -d "{\"http_sources\": [{\"url\": \"https://arxiv.org/pdf/2501.17887\"}], \"options\": {\"to_formats\": [\"md\"], \"do_ocr\": false}}"
+
+# Poll task status (replace TASK_ID with actual ID)
+curl.exe -X GET "http://aidev-d230458-002.dc.gs.com:5001/v1/status/poll/TASK_ID"
+
+# Get task result (replace TASK_ID with actual ID)
+curl.exe -X GET "http://aidev-d230458-002.dc.gs.com:5001/v1/result/TASK_ID"
