@@ -26,6 +26,9 @@ import sys
 import json
 import time
 import argparse
+import tempfile
+import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
@@ -88,6 +91,74 @@ SUPPORTED_EXTENSIONS = set(FILE_FORMAT_MAP.keys())
 DEFAULT_OCR_LANGUAGES = ["en"]
 DEFAULT_IMAGE_SCALE = 2.0
 DEFAULT_OUTPUT_DIR = "docling_output"
+
+
+# ============================================================================
+# URL HANDLING FUNCTIONS
+# ============================================================================
+
+def is_url(path: str) -> bool:
+    """Check if the given path is a URL."""
+    return path.startswith(('http://', 'https://'))
+
+
+def get_extension_from_url(url: str) -> str:
+    """Extract file extension from URL."""
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path
+    # Get the extension from the path
+    ext = os.path.splitext(path)[1].lower()
+    return ext if ext else '.html'  # Default to .html if no extension
+
+
+def download_url_to_temp(url: str) -> Tuple[Path, str]:
+    """
+    Download a URL to a temporary file.
+
+    Args:
+        url: The URL to download
+
+    Returns:
+        Tuple of (temp_file_path, original_filename)
+    """
+    print(f"Downloading URL: {url}")
+
+    # Get extension from URL
+    ext = get_extension_from_url(url)
+
+    # Extract filename from URL for display purposes
+    parsed = urllib.parse.urlparse(url)
+    original_filename = os.path.basename(parsed.path) or "downloaded_content"
+    if not original_filename.endswith(ext):
+        original_filename += ext
+
+    # Create a temporary file with the correct extension
+    temp_dir = tempfile.mkdtemp(prefix="docling_url_")
+    temp_file = Path(temp_dir) / original_filename
+
+    try:
+        # Download the content
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        request = urllib.request.Request(url, headers=headers)
+
+        with urllib.request.urlopen(request, timeout=30) as response:
+            content = response.read()
+            temp_file.write_bytes(content)
+
+        print(f"  Downloaded to: {temp_file}")
+        print(f"  Size: {temp_file.stat().st_size / 1024:.1f} KB")
+
+        return temp_file, original_filename
+
+    except Exception as e:
+        # Clean up on error
+        if temp_file.exists():
+            temp_file.unlink()
+        if Path(temp_dir).exists():
+            Path(temp_dir).rmdir()
+        raise Exception(f"Failed to download URL: {e}")
 
 
 # ============================================================================
@@ -238,6 +309,45 @@ def create_output_structure(output_dir: Path, base_filename: str) -> Dict[str, P
 # TABLE EXTRACTION FUNCTIONS
 # ============================================================================
 
+def extract_table_metadata(table, table_df) -> Dict:
+    """
+    Extract metadata from a table including headers, rows, columns count.
+
+    Args:
+        table: Table object from docling
+        table_df: DataFrame representation of the table
+
+    Returns:
+        Dictionary with table metadata
+    """
+    metadata = {
+        'num_rows': len(table_df),
+        'num_columns': len(table_df.columns),
+        'headers': list(table_df.columns),
+        'has_headers': True,  # DataFrame always has column names
+        'total_cells': len(table_df) * len(table_df.columns),
+    }
+
+    # Try to get additional metadata from table object
+    try:
+        if hasattr(table, 'data') and hasattr(table.data, 'grid'):
+            grid = table.data.grid
+            metadata['grid_rows'] = len(grid) if grid else 0
+            metadata['grid_cols'] = len(grid[0]) if grid and len(grid) > 0 else 0
+    except Exception:
+        pass
+
+    # Try to get bbox/position information
+    try:
+        if hasattr(table, 'prov') and table.prov:
+            metadata['bbox'] = table.prov[0].bbox.as_tuple() if hasattr(table.prov[0], 'bbox') else None
+            metadata['page_number'] = table.prov[0].page_no if hasattr(table.prov[0], 'page_no') else None
+    except Exception:
+        pass
+
+    return metadata
+
+
 def export_tables_to_csv(tables, doc, output_dir: Path, base_filename: str) -> int:
     """
     Export tables to CSV format.
@@ -257,6 +367,12 @@ def export_tables_to_csv(tables, doc, output_dir: Path, base_filename: str) -> i
             table_df = table.export_to_dataframe(doc=doc)
             csv_path = output_dir / f"{base_filename}_table_{table_ix}.csv"
             table_df.to_csv(csv_path, index=False)
+
+            # Export table metadata
+            metadata = extract_table_metadata(table, table_df)
+            metadata_path = output_dir / f"{base_filename}_table_{table_ix}_metadata.json"
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding='utf-8')
+
             count += 1
         except Exception as e:
             print(f"  Warning: Failed to export table {table_ix} to CSV: {e}")
@@ -512,12 +628,22 @@ def process_single_document(
             if tables:
                 print(f"  Exporting {len(tables)} table(s)...")
 
+                # Print table metadata for each table
+                for table_ix, table in enumerate(tables):
+                    try:
+                        table_df = table.export_to_dataframe(doc=conv_result.document)
+                        metadata = extract_table_metadata(table, table_df)
+                        print(f"    Table {table_ix}: {metadata['num_rows']} rows x {metadata['num_columns']} columns")
+                        print(f"      Headers: {', '.join([str(h) for h in metadata['headers'][:5]])}{'...' if len(metadata['headers']) > 5 else ''}")
+                    except Exception:
+                        pass
+
                 # Export to CSV
                 csv_count = export_tables_to_csv(
                     tables, conv_result.document,
                     output_paths['tables'], base_filename
                 )
-                print(f"    [OK] CSV: {csv_count} tables")
+                print(f"    [OK] CSV: {csv_count} tables (with metadata)")
 
                 # Export to Markdown
                 md_count = export_tables_to_markdown(
@@ -702,13 +828,14 @@ Examples:
   %(prog)s samples/ --output-dir ./results
   %(prog)s folder/ --languages en,es,de --fast-mode
   %(prog)s document.pdf --no-ocr --no-page-images
+  %(prog)s https://example.com/page.html --output-dir ./results
         """
     )
 
     parser.add_argument(
         'input_path',
         type=str,
-        help='Input file or directory path'
+        help='Input file, directory path, or URL (http:// or https://)'
     )
 
     parser.add_argument(
@@ -764,11 +891,25 @@ Examples:
 
     args = parser.parse_args()
 
-    # Validate input path
-    input_path = Path(args.input_path)
-    if not input_path.exists():
-        print(f"Error: Input path not found: {input_path}")
-        sys.exit(1)
+    # Track if we downloaded from URL (for cleanup)
+    temp_file_path = None
+    is_url_input = is_url(args.input_path)
+
+    # Handle URL input
+    if is_url_input:
+        try:
+            temp_file_path, original_filename = download_url_to_temp(args.input_path)
+            input_path = temp_file_path
+            print(f"Processing URL as: {original_filename}")
+        except Exception as e:
+            print(f"Error downloading URL: {e}")
+            sys.exit(1)
+    else:
+        # Validate local input path
+        input_path = Path(args.input_path)
+        if not input_path.exists():
+            print(f"Error: Input path not found: {input_path}")
+            sys.exit(1)
 
     # Parse languages
     ocr_languages = [lang.strip() for lang in args.languages.split(',')]
@@ -806,28 +947,38 @@ Examples:
     )
 
     # Process files
-    if len(files) == 1:
-        # Single file processing
-        stats = process_single_document(
-            files[0], output_dir, converter,
-            enable_tables=not args.no_tables,
-            enable_images=not args.no_images,
-            enable_page_images=not args.no_page_images
-        )
+    try:
+        if len(files) == 1:
+            # Single file processing
+            stats = process_single_document(
+                files[0], output_dir, converter,
+                enable_tables=not args.no_tables,
+                enable_images=not args.no_images,
+                enable_page_images=not args.no_page_images
+            )
 
-        if not stats['success']:
-            sys.exit(1)
-    else:
-        # Batch processing
-        summary = process_batch(
-            files, output_dir, converter,
-            enable_tables=not args.no_tables,
-            enable_images=not args.no_images,
-            enable_page_images=not args.no_page_images
-        )
+            if not stats['success']:
+                sys.exit(1)
+        else:
+            # Batch processing
+            summary = process_batch(
+                files, output_dir, converter,
+                enable_tables=not args.no_tables,
+                enable_images=not args.no_images,
+                enable_page_images=not args.no_page_images
+            )
 
-        if summary['failed'] > 0:
-            sys.exit(1)
+            if summary['failed'] > 0:
+                sys.exit(1)
+    finally:
+        # Clean up temporary files from URL downloads
+        if temp_file_path and temp_file_path.exists():
+            try:
+                temp_file_path.unlink()
+                temp_file_path.parent.rmdir()
+                print(f"\nCleaned up temporary file: {temp_file_path}")
+            except Exception:
+                pass  # Ignore cleanup errors
 
 
 if __name__ == "__main__":
