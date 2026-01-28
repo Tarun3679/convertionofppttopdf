@@ -15,19 +15,30 @@ GET {{baseUrl}}/health
 GET {{baseUrl}}/openapi.json
 
 ###############################################################################
-# Convert via URL (Recommended - simpler than file upload)
+# Convert via URL - Simple (no options)
 ###############################################################################
 
-### Convert PDF from URL to Markdown
+### Convert PDF from URL to Markdown (default settings)
 POST {{baseUrl}}/v1/convert/source
 Content-Type: application/json
 
 {
-  "sources": [
-    {
-      "kind": "http",
-      "url": "https://arxiv.org/pdf/2501.17887"
-    }
+  "http_sources": [
+    {"url": "https://arxiv.org/pdf/2501.17887"}
+  ]
+}
+
+###############################################################################
+# Convert via URL - With Options
+###############################################################################
+
+### Convert PDF from URL to Markdown (no OCR)
+POST {{baseUrl}}/v1/convert/source
+Content-Type: application/json
+
+{
+  "http_sources": [
+    {"url": "https://arxiv.org/pdf/2501.17887"}
   ],
   "options": {
     "to_formats": ["md"],
@@ -35,16 +46,13 @@ Content-Type: application/json
   }
 }
 
-### Convert PDF from URL to JSON
+### Convert PDF from URL to JSON (no OCR)
 POST {{baseUrl}}/v1/convert/source
 Content-Type: application/json
 
 {
-  "sources": [
-    {
-      "kind": "http",
-      "url": "https://arxiv.org/pdf/2501.17887"
-    }
+  "http_sources": [
+    {"url": "https://arxiv.org/pdf/2501.17887"}
   ],
   "options": {
     "to_formats": ["json"],
@@ -57,22 +65,37 @@ POST {{baseUrl}}/v1/convert/source
 Content-Type: application/json
 
 {
-  "sources": [
-    {
-      "kind": "http",
-      "url": "https://arxiv.org/pdf/2501.17887"
-    }
+  "http_sources": [
+    {"url": "https://arxiv.org/pdf/2501.17887"}
   ],
   "options": {
     "to_formats": ["md"],
     "do_ocr": true,
+    "ocr_engine": "easyocr",
     "ocr_lang": ["en"]
+  }
+}
+
+### Convert with all options specified
+POST {{baseUrl}}/v1/convert/source
+Content-Type: application/json
+
+{
+  "http_sources": [
+    {"url": "https://arxiv.org/pdf/2501.17887"}
+  ],
+  "options": {
+    "to_formats": ["md"],
+    "do_ocr": false,
+    "table_mode": "fast",
+    "image_export_mode": "placeholder",
+    "abort_on_error": false
   }
 }
 
 ###############################################################################
 # Convert Local File (multipart/form-data)
-# Note: Update the file path after < to your actual file
+# Options passed as query parameters
 ###############################################################################
 
 ### Convert local PDF to Markdown
@@ -111,18 +134,6 @@ Content-Type: application/pdf
 < ./samples/sample.pdf
 ------WebKitFormBoundary--
 
-### Convert local PPTX to JSON
-# @name convertPptxToJson
-POST {{baseUrl}}/v1/convert/file?to_formats=json&do_ocr=false
-Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
-
-------WebKitFormBoundary
-Content-Disposition: form-data; name="files"; filename="presentation.pptx"
-Content-Type: application/vnd.openxmlformats-officedocument.presentationml.presentation
-
-< ./samples/sample.pptx
-------WebKitFormBoundary--
-
 ###############################################################################
 # Async Conversion (for large files)
 ###############################################################################
@@ -133,11 +144,8 @@ POST {{baseUrl}}/v1/convert/source/async
 Content-Type: application/json
 
 {
-  "sources": [
-    {
-      "kind": "http",
-      "url": "https://arxiv.org/pdf/2501.17887"
-    }
+  "http_sources": [
+    {"url": "https://arxiv.org/pdf/2501.17887"}
   ],
   "options": {
     "to_formats": ["md"],
