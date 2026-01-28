@@ -26,7 +26,8 @@ class DocumentConversion:
     links_found: int = 0
     link_types: list = field(default_factory=list)
     conversion_successful: bool = False
-    pdf_size_mb: Optional[float] = None
+    input_size_mb: Optional[float] = None  # Original file size
+    pdf_size_mb: Optional[float] = None    # Output PDF size
     conversion_time_seconds: Optional[float] = None
     attempt_number: int = 1
     max_retries: int = 2
@@ -48,6 +49,7 @@ def parse_log_line(line: str) -> dict:
         'links_found': None,
         'link_types': None,
         'success': None,
+        'input_size': None,
         'pdf_size': None,
         'conversion_time': None,
         'attempt': None,
@@ -65,13 +67,15 @@ def parse_log_line(line: str) -> dict:
         result['file_type'] = entry_match.group(1)
         result['max_retries'] = int(entry_match.group(3))
 
-    # Check for conversion attempt with filename
-    attempt_match = re.search(r'\[Attempt\s+(\d+)/(\d+)\]\s+Converting\s+(\w+)_input_([^\s]+)', line)
+    # Check for conversion attempt with filename and input size
+    # Pattern: [Attempt 1/2] Converting powerpoint_input_tb4d9bve.pptx (0.2MB)...
+    attempt_match = re.search(r'\[Attempt\s+(\d+)/(\d+)\]\s+Converting\s+(\w+)_input_([^\s]+)\s+\(([\d.]+)MB\)', line)
     if attempt_match:
         result['event_type'] = 'ATTEMPT'
         result['attempt'] = int(attempt_match.group(1))
         result['file_type'] = attempt_match.group(3)
         result['filename'] = f"{attempt_match.group(3)}_input_{attempt_match.group(4)}"
+        result['input_size'] = float(attempt_match.group(5))
 
     # Check for LINK_SCAN results
     link_scan_match = re.search(r'\[LINK_SCAN\]\s+file=[\'"]?([^\'"]+)[\'"]?\s+external_links_found=(\d+)\s+link_types=\[([^\]]*)\]', line)
@@ -118,7 +122,7 @@ def parse_logs(log_content: str) -> list[DocumentConversion]:
         if parsed['event_type'] == 'ENTRY':
             current_type = parsed['file_type']
 
-        # Handle ATTEMPT - get the filename
+        # Handle ATTEMPT - get the filename and input size
         if parsed['event_type'] == 'ATTEMPT':
             current_file = parsed['filename']
             if current_file not in conversions:
@@ -126,10 +130,13 @@ def parse_logs(log_content: str) -> list[DocumentConversion]:
                     filename=current_file,
                     file_type=parsed['file_type'],
                     attempt_number=parsed['attempt'],
+                    input_size_mb=parsed['input_size'],
                     timestamp=parsed['timestamp'] or ""
                 )
             else:
                 conversions[current_file].attempt_number = parsed['attempt']
+                if parsed['input_size'] is not None:
+                    conversions[current_file].input_size_mb = parsed['input_size']
 
         # Handle LINK_SCAN - update link information
         if parsed['event_type'] == 'LINK_SCAN':
@@ -208,21 +215,22 @@ def generate_report(conversions: list[DocumentConversion]) -> str:
 
     # Detailed table
     report_lines.append("DETAILED CONVERSION RESULTS")
-    report_lines.append("-" * 100)
-    report_lines.append(f"{'Filename':<45} {'Type':<12} {'Links':<8} {'Link Types':<20} {'Status':<10} {'PDF Size':<10}")
-    report_lines.append("-" * 100)
+    report_lines.append("-" * 120)
+    report_lines.append(f"{'Filename':<40} {'Type':<12} {'Links':<6} {'Link Types':<15} {'Status':<10} {'Input Size':<12} {'PDF Size':<12}")
+    report_lines.append("-" * 120)
 
     for conv in sorted(conversions, key=lambda x: (not x.has_links, x.filename)):
         links_str = str(conv.links_found) if conv.has_links else "0"
         link_types_str = ", ".join(conv.link_types) if conv.link_types else "-"
         status = "SUCCESS" if conv.conversion_successful else "FAILED"
+        input_size = f"{conv.input_size_mb:.2f}MB" if conv.input_size_mb is not None else "-"
         pdf_size = f"{conv.pdf_size_mb:.2f}MB" if conv.pdf_size_mb else "-"
 
         # Truncate filename if too long
-        filename = conv.filename[:42] + "..." if len(conv.filename) > 45 else conv.filename
-        link_types_str = link_types_str[:17] + "..." if len(link_types_str) > 20 else link_types_str
+        filename = conv.filename[:37] + "..." if len(conv.filename) > 40 else conv.filename
+        link_types_str = link_types_str[:12] + "..." if len(link_types_str) > 15 else link_types_str
 
-        report_lines.append(f"{filename:<45} {conv.file_type:<12} {links_str:<8} {link_types_str:<20} {status:<10} {pdf_size:<10}")
+        report_lines.append(f"{filename:<40} {conv.file_type:<12} {links_str:<6} {link_types_str:<15} {status:<10} {input_size:<12} {pdf_size:<12}")
 
     report_lines.append("")
     report_lines.append("=" * 100)
@@ -240,6 +248,8 @@ def generate_report(conversions: list[DocumentConversion]) -> str:
             report_lines.append(f"  Links found: {conv.links_found}")
             report_lines.append(f"  Link types: {conv.link_types}")
             report_lines.append(f"  Conversion status: {status}")
+            if conv.input_size_mb is not None:
+                report_lines.append(f"  Input size: {conv.input_size_mb}MB")
             if conv.pdf_size_mb:
                 report_lines.append(f"  PDF size: {conv.pdf_size_mb}MB")
             if conv.conversion_time_seconds:
@@ -251,14 +261,15 @@ def generate_report(conversions: list[DocumentConversion]) -> str:
 
 def generate_csv(conversions: list[DocumentConversion]) -> str:
     """Generate CSV output from the parsed conversions."""
-    lines = ["filename,file_type,has_links,links_found,link_types,conversion_successful,pdf_size_mb,conversion_time_seconds"]
+    lines = ["filename,file_type,has_links,links_found,link_types,conversion_successful,input_size_mb,pdf_size_mb,conversion_time_seconds"]
 
     for conv in conversions:
         link_types_str = "|".join(conv.link_types) if conv.link_types else ""
+        input_size = conv.input_size_mb if conv.input_size_mb is not None else ""
         lines.append(
             f'"{conv.filename}",{conv.file_type},{conv.has_links},{conv.links_found},'
             f'"{link_types_str}",{conv.conversion_successful},'
-            f'{conv.pdf_size_mb or ""},{conv.conversion_time_seconds or ""}'
+            f'{input_size},{conv.pdf_size_mb or ""},{conv.conversion_time_seconds or ""}'
         )
 
     return "\n".join(lines)
@@ -299,10 +310,6 @@ def main():
         print(f"Output written to {args.output}")
     else:
         print(output)
-
-
-
-
 
 if __name__ == '__main__':
     import sys
