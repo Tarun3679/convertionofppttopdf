@@ -1,6 +1,9 @@
 # =============================================================================
 # HEALTH CHECK & DOCS
 # =============================================================================
+curl.exe -X POST "http://aidev-d230458-002.dc.gs.com:5001/v1/convert/source" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"sources\":[{\"kind\":\"http\",\"url\":\"https://arxiv.org/pdf/2501.17887.pdf\"}],\"options\":{}}"
 
 # Health check
 curl.exe -X GET "http://aidev-d230458-002.dc.gs.com:5001/health"
