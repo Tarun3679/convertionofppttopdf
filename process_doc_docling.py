@@ -19,6 +19,8 @@ Usage:
     python process_documents_with_docling.py samples/
     python process_documents_with_docling.py document.pdf --languages en,es
     python process_documents_with_docling.py folder/ --output-dir ./output --fast-mode
+    python process_documents_with_docling.py document.pdf --vlm
+    python process_documents_with_docling.py document.pdf --vlm --vlm-model granite-docling-mlx
 """
 
 import os
@@ -52,7 +54,10 @@ try:
         TableFormerMode,
         TableStructureOptions,
         EasyOcrOptions,
+        VlmPipelineOptions,
     )
+    from docling.datamodel import vlm_model_specs
+    from docling.pipeline.vlm_pipeline import VlmPipeline
 except ImportError:
     print("Error: docling is required. Install with: pip install docling")
     sys.exit(1)
@@ -173,7 +178,9 @@ def create_document_converter(
     ocr_languages: List[str] = None,
     fast_mode: bool = False,
     image_scale: float = DEFAULT_IMAGE_SCALE,
-    artifacts_path: Optional[str] = None
+    artifacts_path: Optional[str] = None,
+    use_vlm: bool = False,
+    vlm_model: str = "granite-docling"
 ) -> DocumentConverter:
     """
     Create and configure a DocumentConverter with all pipeline options.
@@ -187,6 +194,8 @@ def create_document_converter(
         artifacts_path: Optional path to store downloaded models (for offline use)
         fast_mode: Use fast mode (TableFormerMode.FAST) instead of accurate mode
         image_scale: Resolution scale for images (default: 2.0)
+        use_vlm: Use VLM (Vision Language Model) pipeline instead of standard pipeline
+        vlm_model: VLM model to use: "granite-docling", "granite-docling-mlx", "smoldocling"
 
     Returns:
         Configured DocumentConverter instance
@@ -194,7 +203,38 @@ def create_document_converter(
     if ocr_languages is None:
         ocr_languages = DEFAULT_OCR_LANGUAGES
 
-    # Configure PDF pipeline options with maximum accuracy
+    # Use VLM pipeline if requested
+    if use_vlm:
+        # Select VLM model specification
+        vlm_model_map = {
+            "granite-docling": vlm_model_specs.GRANITEDOCLING_TRANSFORMERS,
+            "granite-docling-mlx": vlm_model_specs.GRANITEDOCLING_MLX,
+            "smoldocling": vlm_model_specs.SMOLDOCLING_TRANSFORMERS,
+        }
+
+        model_spec = vlm_model_map.get(vlm_model.lower())
+        if model_spec is None:
+            print(f"Warning: Unknown VLM model '{vlm_model}', using granite-docling")
+            model_spec = vlm_model_specs.GRANITEDOCLING_TRANSFORMERS
+
+        # Configure VLM pipeline options
+        vlm_options = VlmPipelineOptions(vlm_options=model_spec)
+
+        # Set artifacts path if provided
+        if artifacts_path:
+            vlm_options.artifacts_path = artifacts_path
+
+        format_options = {
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_cls=VlmPipeline,
+                pipeline_options=vlm_options,
+            ),
+        }
+
+        converter = DocumentConverter(format_options=format_options)
+        return converter
+
+    # Standard pipeline configuration
     pdf_pipeline_options = PdfPipelineOptions()
     pdf_pipeline_options.do_ocr = enable_ocr
     pdf_pipeline_options.do_table_structure = enable_tables
@@ -829,6 +869,8 @@ Examples:
   %(prog)s folder/ --languages en,es,de --fast-mode
   %(prog)s document.pdf --no-ocr --no-page-images
   %(prog)s https://example.com/page.html --output-dir ./results
+  %(prog)s document.pdf --vlm
+  %(prog)s document.pdf --vlm --vlm-model granite-docling-mlx
         """
     )
 
@@ -889,6 +931,20 @@ Examples:
         help='Path to store/load model artifacts (helps with offline use and network issues)'
     )
 
+    parser.add_argument(
+        '--vlm',
+        action='store_true',
+        help='Use VLM (Vision Language Model) pipeline for document conversion'
+    )
+
+    parser.add_argument(
+        '--vlm-model',
+        type=str,
+        default='granite-docling',
+        choices=['granite-docling', 'granite-docling-mlx', 'smoldocling'],
+        help='VLM model to use (default: granite-docling). Use granite-docling-mlx for Mac with MPS'
+    )
+
     args = parser.parse_args()
 
     # Track if we downloaded from URL (for cleanup)
@@ -927,10 +983,15 @@ Examples:
 
     # Configure converter
     print("Initializing Docling DocumentConverter...")
-    print(f"  OCR: {'Disabled' if args.no_ocr else 'Enabled'}")
-    print(f"  OCR Languages: {', '.join(ocr_languages)}")
-    print(f"  Table Extraction: {'Disabled' if args.no_tables else 'Enabled'}")
-    print(f"  Table Mode: {'Fast' if args.fast_mode else 'Accurate'}")
+    if args.vlm:
+        print(f"  Pipeline: VLM (Vision Language Model)")
+        print(f"  VLM Model: {args.vlm_model}")
+    else:
+        print(f"  Pipeline: Standard")
+        print(f"  OCR: {'Disabled' if args.no_ocr else 'Enabled'}")
+        print(f"  OCR Languages: {', '.join(ocr_languages)}")
+        print(f"  Table Extraction: {'Disabled' if args.no_tables else 'Enabled'}")
+        print(f"  Table Mode: {'Fast' if args.fast_mode else 'Accurate'}")
     print(f"  Image Extraction: {'Disabled' if args.no_images else 'Enabled'}")
     print(f"  Page Images: {'Disabled' if args.no_page_images else 'Enabled'}")
     if args.artifacts_path:
@@ -943,7 +1004,9 @@ Examples:
         enable_page_images=not args.no_page_images,
         ocr_languages=ocr_languages,
         fast_mode=args.fast_mode,
-        artifacts_path=args.artifacts_path
+        artifacts_path=args.artifacts_path,
+        use_vlm=args.vlm,
+        vlm_model=args.vlm_model
     )
 
     # Process files
